@@ -129,29 +129,6 @@ st.dataframe(df_obs)
 st.metric("RMSE", round(rmse,3))
 
 # -------------------------
-# AUTOMATIC CALIBRATION
-# -------------------------
-
-st.subheader("Automatic Kf Calibration")
-
-def objective(log_k):
-
-    k = 10**log_k
-    sim = simulate_heads(k)
-    residuals = sim - df_obs["Observed Head"].values
-    return np.mean(residuals**2)
-
-result = minimize(
-    objective,
-    x0=np.log10(kf),
-    bounds=[(log_min,log_max)]
-)
-
-best_kf = 10**result.x[0]
-
-st.write("Estimated Best Kf:", round(best_kf,3),"m/day")
-
-# -------------------------
 # SENSITIVITY PLOT
 # -------------------------
 
