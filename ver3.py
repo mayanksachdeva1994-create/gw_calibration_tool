@@ -6,16 +6,11 @@ from scipy.optimize import minimize
 
 st.title("Groundwater Pre-Calibration Tool")
 
-st.write(
-"""
-Conceptual groundwater calibration tool for estimating hydraulic conductivity (Kf).
-All parameters use consistent units (meters and days).
-"""
-)
+st.write("Conceptual groundwater calibration tool based on steady-state recharge conditions.")
 
-# -----------------------------
+# -------------------------
 # SIDEBAR PARAMETERS
-# -----------------------------
+# -------------------------
 
 st.sidebar.header("Aquifer Parameters")
 
@@ -26,23 +21,18 @@ R = st.sidebar.number_input(
 )
 
 L = st.sidebar.number_input(
-    "Aquifer Length L (m)",
+    "Aquifer Flow Length L (m)",
     value=1000.0
 )
 
-h1 = st.sidebar.number_input(
-    "Upstream Boundary Head h1 (m)",
-    value=52.0
+h0 = st.sidebar.number_input(
+    "Boundary Head h0 (m)",
+    value=50.0
 )
 
-h2 = st.sidebar.number_input(
-    "Downstream Boundary Head h2 (m)",
-    value=49.0
-)
-
-# -----------------------------
+# -------------------------
 # OBSERVATION WELLS
-# -----------------------------
+# -------------------------
 
 st.subheader("Observation Wells")
 
@@ -61,14 +51,14 @@ for i in range(n_wells):
 
     with col1:
         x = st.number_input(
-            f"Distance of Well {i+1} from upstream boundary (m)",
-            value=200*(i+1),
+            f"Distance x{i+1} from boundary (m)",
+            value=100*(i+1),
             key=f"x{i}"
         )
 
     with col2:
         head = st.number_input(
-            f"Observed Head Well {i+1} (m)",
+            f"Observed Head h{i+1} (m)",
             value=50.0,
             key=f"h{i}"
         )
@@ -77,9 +67,9 @@ for i in range(n_wells):
 
 df_obs = pd.DataFrame(data, columns=["Distance","Observed Head"])
 
-# -----------------------------
+# -------------------------
 # Kf RANGE
-# -----------------------------
+# -------------------------
 
 st.sidebar.header("Hydraulic Conductivity")
 
@@ -107,31 +97,23 @@ kf = 10**log_kf
 
 st.sidebar.write("Selected Kf:", round(kf,3),"m/day")
 
-# -----------------------------
+# -------------------------
 # SIMULATION FUNCTION
-# -----------------------------
+# -------------------------
 
 def simulate_heads(kf):
 
     heads = []
 
     for x in df_obs["Distance"]:
-
-        h_sq = (
-            h1**2
-            - ((h1**2 - h2**2)/L) * x
-            + (R/kf) * x * (L-x)
-        )
-
-        h = np.sqrt(max(h_sq,0))
-
+        h = np.sqrt(h0**2 + (R/kf) * x * (L-x))
         heads.append(h)
 
     return np.array(heads)
 
-# -----------------------------
-# RUN SIMULATION
-# -----------------------------
+# -------------------------
+# MANUAL SIMULATION
+# -------------------------
 
 sim_heads = simulate_heads(kf)
 
@@ -146,9 +128,9 @@ st.dataframe(df_obs)
 
 st.metric("RMSE", round(rmse,3))
 
-# -----------------------------
+# -------------------------
 # AUTOMATIC CALIBRATION
-# -----------------------------
+# -------------------------
 
 st.subheader("Automatic Kf Calibration")
 
@@ -157,7 +139,6 @@ def objective(log_k):
     k = 10**log_k
     sim = simulate_heads(k)
     residuals = sim - df_obs["Observed Head"].values
-
     return np.mean(residuals**2)
 
 result = minimize(
@@ -170,9 +151,9 @@ best_kf = 10**result.x[0]
 
 st.write("Estimated Best Kf:", round(best_kf,3),"m/day")
 
-# -----------------------------
-# SENSITIVITY ANALYSIS
-# -----------------------------
+# -------------------------
+# SENSITIVITY PLOT
+# -------------------------
 
 st.subheader("Sensitivity Analysis")
 
@@ -201,37 +182,31 @@ fig = px.line(
 
 st.plotly_chart(fig)
 
-# -----------------------------
-# EQUATION DISPLAY
-# -----------------------------
+# -------------------------
+# EQUATION
+# -------------------------
 
 st.markdown("---")
-st.header("Governing Groundwater Equation")
+st.header("Governing Equation")
 
 st.latex(r'''
-h(x)^2 =
-h_1^2 -
-\frac{(h_1^2-h_2^2)}{L}x +
-\frac{R}{K_f}x(L-x)
+h(x)=\sqrt{h_0^2+\frac{R}{K_f}x(L-x)}
 ''')
 
 st.write(
-"""
-This equation represents steady-state groundwater flow in an aquifer receiving uniform recharge.
-"""
+"This equation describes steady groundwater flow with uniform recharge in a one-dimensional aquifer."
 )
 
-# -----------------------------
+# -------------------------
 # VARIABLE DEFINITIONS
-# -----------------------------
+# -------------------------
 
 st.header("Variable Definitions")
 
 definitions = {
 "Variable":[
 "h(x)",
-"h1",
-"h2",
+"h0",
 "R",
 "Kf",
 "x",
@@ -240,16 +215,14 @@ definitions = {
 
 "Description":[
 "Simulated groundwater head at distance x",
-"Groundwater head at upstream boundary",
-"Groundwater head at downstream boundary",
-"Recharge entering the aquifer",
-"Hydraulic conductivity of the aquifer",
-"Distance from upstream boundary along groundwater flow direction",
-"Total groundwater flow length between boundaries"
+"Groundwater head at the upstream boundary",
+"Areal recharge entering the aquifer",
+"Hydraulic conductivity of the aquifer material",
+"Distance from the upstream boundary along the groundwater flow direction",
+"Total groundwater flow length between hydraulic boundaries"
 ],
 
 "Units":[
-"m",
 "m",
 "m",
 "m/day",
@@ -263,17 +236,11 @@ st.table(pd.DataFrame(definitions))
 
 st.write(
 """
-Conceptual assumptions:
+The conceptual model assumes:
 
-• steady-state groundwater conditions  
+• steady-state groundwater flow  
 • homogeneous aquifer properties  
-• uniform recharge  
+• uniform recharge across the aquifer  
 • one-dimensional flow along the hydraulic gradient
-"""
-)
-
-st.write(
-"""
-This simplified conceptual model helps estimate realistic Kf values before building full numerical groundwater models.
 """
 )
