@@ -25,18 +25,18 @@ R = st.sidebar.number_input(
 
 L = st.sidebar.number_input(
     "Aquifer Length L (m)",
-    value=1000.0,
+    value=3000.0,
     min_value=1.0
 )
 
 h1 = st.sidebar.number_input(
     "Upstream Boundary Head h1 (m)",
-    value=52.0
+    value=30.0
 )
 
 h2 = st.sidebar.number_input(
     "Downstream Boundary Head h2 (m)",
-    value=49.0
+    value=20.0
 )
 
 # ------------------------------------------------
@@ -179,37 +179,6 @@ st.subheader("Simulation Results")
 st.dataframe(df_obs)
 
 st.metric("RMSE",round(rmse,3))
-
-# ------------------------------------------------
-# AUTOMATIC CALIBRATION
-# ------------------------------------------------
-
-st.subheader("Automatic Kf Calibration")
-
-def objective(log_k):
-
-    log_k = float(log_k)
-
-    k = 10**log_k
-
-    sim = simulate_heads(k)
-
-    residuals = sim - df_obs["Observed Head"].values
-
-    return float(np.nanmean(residuals**2))
-
-result = minimize(
-    objective,
-    x0=np.log10(kf),
-    bounds=[(log_min,log_max)]
-)
-
-if result.success:
-    best_kf = 10**result.x[0]
-else:
-    best_kf = np.nan
-
-st.write("Estimated Best Kf:",round(best_kf,4),"m/day")
 
 # ------------------------------------------------
 # GROUNDWATER PROFILE
