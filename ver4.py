@@ -352,20 +352,8 @@ col1, col2, col3 = st.columns(3)
 col1.metric("RMSE (m)", round(current_rmse, 4))
 col2.metric("Max Abs Residual (m)", round(df_results["Abs Residual (m)"].max(), 4))
 col3.metric("Kf Used (m/day)", round(kf_best, 4))
- 
-def color_residuals(val):
-    if val < 0.05:
-        color = "#d4edda"   # green  — good fit
-    elif val < 0.20:
-        color = "#fff3cd"   # yellow — moderate
-    else:
-        color = "#f8d7da"   # red    — poor fit
-    return f"background-color: {color}"
- 
-st.dataframe(
-    df_results.style.map(color_residuals, subset=["Abs Residual (m)"]),
-    use_container_width=True
-)
+  
+st.dataframe(df_results,use_container_width=True)
  
 # ─────────────────────────────────────────────
 # HEAD PROFILE PLOT (new)
