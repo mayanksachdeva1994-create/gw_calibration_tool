@@ -2,403 +2,518 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.express as px
-from scipy.optimize import minimize
+import plotly.graph_objects as go
+from scipy.optimize import minimize_scalar
 
-st.title("Groundwater Pre-Calibration Tool")
+# ─────────────────────────────────────────────
+# PAGE CONFIG
+# ─────────────────────────────────────────────
 
-st.write("""
-Conceptual groundwater calibration tool for estimating hydraulic conductivity (Kf).
-All parameters use consistent units (meters and days).
-""")
+st.set_page_config(
+    page_title="Groundwater Pre-Calibration Tool",
+    page_icon="💧",
+    layout="wide"
+)
 
-# ------------------------------------------------
-# SIDEBAR PARAMETERS
-# ------------------------------------------------
+st.title("💧 Groundwater Pre-Calibration Tool")
+st.markdown(
+    """
+    Steady-state 1D analytical calibration for **unconfined aquifers** using the
+    Dupuit–Forchheimer equation. Estimates hydraulic conductivity **Kf** by
+    minimising RMSE against observed well heads.
+    
+    > ⚠️ **Assumption**: Unconfined aquifer, homogeneous & isotropic, uniform recharge, 1D flow.  
+    > For confined aquifers the governing equation is linear in h (not h²) — use a different model.
+    """
+)
 
-st.sidebar.header("Aquifer Parameters")
+st.markdown("---")
+
+# ─────────────────────────────────────────────
+# SIDEBAR — AQUIFER PARAMETERS
+# ─────────────────────────────────────────────
+
+st.sidebar.header("⚙️ Aquifer Parameters")
 
 R = st.sidebar.number_input(
     "Recharge R (m/day)",
+    min_value=0.0,
     value=0.0003,
-    format="%.6f"
+    format="%.6f",
+    help="Typical range: 0.00001–0.005 m/day (0.004–1.8 m/yr). "
+         "0.0003 m/day ≈ 11 cm/yr (semi-arid)."
 )
 
 L = st.sidebar.number_input(
     "Aquifer Length L (m)",
-    value=3000.0,
-    min_value=1.0
+    min_value=1.0,
+    value=1000.0,
+    help="Distance between upstream and downstream fixed-head boundaries."
 )
 
 h1 = st.sidebar.number_input(
-    "Upstream Boundary Head h1 (m)",
-    value=30.0
+    "Upstream Head h₁ (m)",
+    value=52.0,
+    help="Fixed head at the upstream boundary (x = 0)."
 )
 
 h2 = st.sidebar.number_input(
-    "Downstream Boundary Head h2 (m)",
-    value=20.0
+    "Downstream Head h₂ (m)",
+    value=49.0,
+    help="Fixed head at the downstream boundary (x = L)."
 )
 
-# ------------------------------------------------
-# FILE UPLOAD
-# ------------------------------------------------
+# ─────────────────────────────────────────────
+# INPUT VALIDATION
+# ─────────────────────────────────────────────
 
-st.subheader("Load Observation Wells")
+errors = []
 
-uploaded_file = st.file_uploader(
-    "Upload Excel or CSV file",
-    type=["xlsx","csv"]
+if L <= 0:
+    errors.append("Aquifer length L must be > 0.")
+if h1 <= 0 or h2 <= 0:
+    errors.append("Boundary heads h₁ and h₂ must be positive (unconfined aquifer).")
+if h1 < h2:
+    errors.append("Upstream head h₁ should be ≥ downstream head h₂ for typical recharge conditions.")
+if R < 0:
+    errors.append("Recharge R cannot be negative.")
+
+if errors:
+    for e in errors:
+        st.error(e)
+    st.stop()
+
+# ─────────────────────────────────────────────
+# OBSERVATION WELLS
+# ─────────────────────────────────────────────
+
+st.subheader("🔵 Observation Wells")
+
+n_wells = st.number_input(
+    "Number of observation wells",
+    min_value=1,
+    max_value=20,
+    value=3,
+    help="Enter at least 2 wells for a meaningful calibration."
 )
 
-st.info("File must contain columns: 'Distance' and 'Observed Head'")
+data = []
 
-if uploaded_file is not None:
+# Shadow keys (_sv_h{i}, _sv_x{i}) are written by the synthetic loader BEFORE
+# widgets render. The number_input widgets read from them as default values.
+# We never write directly to the widget keys (h{i}, x{i}) after render —
+# that is what causes StreamlitAPIException.
 
-    if uploaded_file.name.endswith(".csv"):
-        df_obs = pd.read_csv(uploaded_file)
+cols_header = st.columns([1, 2, 2])
+cols_header[0].markdown("**Well #**")
+cols_header[1].markdown("**Distance from upstream (m)**")
+cols_header[2].markdown("**Observed Head (m)**")
 
+for i in range(int(n_wells)):
+    col0, col1, col2 = st.columns([1, 2, 2])
+
+    # Read from shadow keys if synthetic loader has populated them
+    default_x = float(st.session_state.get(f"_sv_x{i}", min(float(200 * (i + 1)), float(L) * 0.9)))
+    default_h = float(st.session_state.get(f"_sv_h{i}", 50.0))
+
+    with col0:
+        st.markdown(f"<br>Well {i+1}", unsafe_allow_html=True)
+    with col1:
+        x = st.number_input(
+            f"x_{i+1}",
+            min_value=0.0,
+            max_value=float(L),
+            value=default_x,
+            key=f"x{i}",
+            label_visibility="collapsed"
+        )
+    with col2:
+        head = st.number_input(
+            f"h_{i+1}",
+            value=default_h,
+            key=f"h{i}",
+            label_visibility="collapsed"
+        )
+    data.append([x, head])
+
+df_obs = pd.DataFrame(data, columns=["Distance", "Observed Head"])
+
+# Validate well positions
+if df_obs["Distance"].duplicated().any():
+    st.warning("⚠️ Two or more wells share the same position. Results may be misleading.")
+
+if (df_obs["Distance"] <= 0).any() or (df_obs["Distance"] >= L).any():
+    st.warning("⚠️ Well positions should be strictly between 0 and L (not on boundaries).")
+
+# ─────────────────────────────────────────────
+# SYNTHETIC OBSERVATION GENERATOR
+# ─────────────────────────────────────────────
+
+st.subheader("🧪 Synthetic Observation Generator")
+
+with st.expander("Generate synthetic well heads from a known Kf (for testing & understanding)", expanded=False):
+
+    st.markdown(
+        """
+        Use this to **test the calibration** or to understand why flat observed heads
+        cause the optimizer to prefer high Kf values.  
+        
+        Enter a *known* (true) Kf → compute what the heads **should** look like at your
+        well positions → load them directly into the observation table above.
+        
+        > 💡 The calibration should then recover this Kf exactly (RMSE → 0).
+        """
+    )
+
+    kf_true = st.number_input(
+        "True Kf for synthetic generation (m/day)",
+        min_value=1e-6,
+        value=5.0,
+        format="%.4f",
+        help="This is the 'ground truth' Kf you want the calibration to rediscover."
+    )
+
+    # Preview the synthetic heads before loading
+    x_wells = df_obs["Distance"].values
+
+    def simulate_heads_generic(kf, x_values, h1_, h2_, L_, R_):
+        """Standalone version so it works before df_obs is finalised."""
+        h_sq = (
+            h1_ ** 2
+            - ((h1_ ** 2 - h2_ ** 2) / L_) * x_values
+            + (R_ / kf) * x_values * (L_ - x_values)
+        )
+        return np.sqrt(np.maximum(h_sq, 0))
+
+    synthetic_heads = simulate_heads_generic(kf_true, x_wells, h1, h2, L, R)
+
+    # Show preview table
+    df_preview = pd.DataFrame({
+        "Well": [f"Well {i+1}" for i in range(len(x_wells))],
+        "Distance (m)": x_wells,
+        "Synthetic Head (m)": np.round(synthetic_heads, 4),
+        "Linear Baseline (m)": np.round(
+            simulate_heads_generic(1e9, x_wells, h1, h2, L, R), 4
+        ),
+        "Mound above baseline (m)": np.round(
+            synthetic_heads - simulate_heads_generic(1e9, x_wells, h1, h2, L, R), 4
+        ),
+    })
+
+    st.dataframe(df_preview, use_container_width=True)
+
+    # Check if the mound is detectable — warn user if signal is too weak
+    max_mound = df_preview["Mound above baseline (m)"].max()
+    if max_mound < 0.01:
+        st.warning(
+            f"⚠️ Maximum recharge mound is only **{max_mound:.4f} m** above the linear baseline. "
+            "This signal is too weak — the calibration will still prefer high Kf. "
+            "Try increasing R or decreasing Kf_true."
+        )
     else:
-        df_obs = pd.read_excel(uploaded_file)
+        st.success(
+            f"✅ Maximum recharge mound = **{max_mound:.4f} m** above baseline. "
+            "This signal is strong enough for the calibration to identify Kf."
+        )
 
-    st.success("File loaded successfully")
-    st.dataframe(df_obs)
+    # ── LOAD BUTTON ──────────────────────────────────────────────────
+    # Only active if mound is detectable (> 0.01 m)
+    load_disabled = bool(max_mound < 0.01)
 
-else:
-
-    # ------------------------------------------------
-    # MANUAL WELL INPUT
-    # ------------------------------------------------
-
-    st.subheader("Observation Wells")
-
-    n_wells = st.number_input(
-        "Number of wells",
-        min_value=1,
-        max_value=20,
-        value=3
+    load_clicked = st.button(
+        "📥 Load synthetic heads into observation wells",
+        disabled=load_disabled,
+        type="primary",
+        help="Disabled when the recharge mound is too small to be informative."
+        if load_disabled else
+        "Click to overwrite the observed heads above with these synthetic values."
     )
 
-    data = []
+    if load_clicked:
+        # Write to SHADOW keys only — never to widget keys after render
+        for i, h_val in enumerate(synthetic_heads):
+            st.session_state[f"_sv_h{i}"] = float(round(h_val, 4))
+        st.session_state["loaded_kf_true"] = float(kf_true)
+        st.success(
+            f"✅ Synthetic heads loaded for Kf_true = {kf_true} m/day. "
+            "The observation wells above have been updated — run Auto-Calibration to recover this value."
+        )
+        st.rerun()
 
-    for i in range(n_wells):
+    # Show reminder if synthetic data was previously loaded
+    if "loaded_kf_true" in st.session_state:
+        st.info(
+            f"ℹ️ Currently loaded: synthetic heads generated from Kf_true = "
+            f"**{st.session_state['loaded_kf_true']} m/day**. "
+            "Auto-calibration should recover this value."
+        )
 
-        col1, col2 = st.columns(2)
+# ─────────────────────────────────────────────
+# Kf RANGE & MANUAL SLIDER
+# ─────────────────────────────────────────────
 
-        with col1:
-            x = st.number_input(
-                f"Distance Well {i+1} (m)",
-                min_value=0.0,
-                max_value=L,
-                value=min(200*(i+1),L),
-                key=f"x{i}"
-            )
+st.sidebar.header("🔬 Hydraulic Conductivity")
 
-        with col2:
-            head = st.number_input(
-                f"Observed Head Well {i+1} (m)",
-                value=50.0,
-                key=f"h{i}"
-            )
+kf_min = st.sidebar.number_input("Minimum Kf (m/day)", value=0.1, min_value=1e-6)
+kf_max = st.sidebar.number_input("Maximum Kf (m/day)", value=100.0)
 
-        data.append([x,head])
-
-    df_obs = pd.DataFrame(
-        data,
-        columns=["Distance","Observed Head"]
-    )
-
-# ------------------------------------------------
-# HYDRAULIC CONDUCTIVITY
-# ------------------------------------------------
-
-st.sidebar.header("Hydraulic Conductivity")
-
-kf_min = st.sidebar.number_input(
-    "Minimum Kf (m/day)",
-    value=0.1,
-    min_value=1e-6
-)
-
-kf_max = st.sidebar.number_input(
-    "Maximum Kf (m/day)",
-    value=100.0
-)
+if kf_min >= kf_max:
+    st.sidebar.error("Kf min must be less than Kf max.")
+    st.stop()
 
 log_min = np.log10(kf_min)
 log_max = np.log10(kf_max)
 
 log_kf = st.sidebar.slider(
-    "log10(Kf)",
+    "Manual log₁₀(Kf)",
     float(log_min),
     float(log_max),
-    float((log_min+log_max)/2)
+    float((log_min + log_max) / 2),
+    help="Slide to manually explore the effect of Kf on heads."
 )
 
-kf = 10**log_kf
+kf_manual = 10 ** log_kf
+st.sidebar.write(f"**Selected Kf:** {round(kf_manual, 4)} m/day")
 
-st.sidebar.write("Selected Kf:",round(kf,4),"m/day")
-
-# ------------------------------------------------
+# ─────────────────────────────────────────────
 # SIMULATION FUNCTION
-# ------------------------------------------------
+# ─────────────────────────────────────────────
 
-def simulate_heads(kf):
+def simulate_heads(kf, x_values):
+    """
+    Dupuit-Forchheimer analytical solution for steady-state unconfined
+    flow between two fixed-head boundaries with uniform recharge.
 
-    heads = []
-
-    for x in df_obs["Distance"].values:
-
-        h_sq = (
-            h1**2
-            - ((h1**2-h2**2)/L)*x
-            + (R/kf)*x*(L-x)
-        )
-
-        if h_sq < 0:
-            h = np.nan
-        else:
-            h = np.sqrt(h_sq)
-
-        heads.append(h)
-
-    return np.array(heads,dtype=float)
-
-# ------------------------------------------------
-# RUN SIMULATION
-# ------------------------------------------------
-
-sim_heads = simulate_heads(kf)
-
-df_obs["Simulated Head"] = sim_heads
-df_obs["Residual"] = df_obs["Simulated Head"] - df_obs["Observed Head"]
-
-rmse = np.sqrt(np.nanmean(df_obs["Residual"]**2))
-
-st.subheader("Simulation Results")
-
-st.dataframe(df_obs)
-
-st.metric("RMSE",round(rmse,3))
-
-# ------------------------------------------------
-# GROUNDWATER PROFILE
-# ------------------------------------------------
-
-st.subheader("Groundwater Profile")
-
-plot_df = df_obs.sort_values("Distance")
-
-fig_profile = px.scatter(
-    plot_df,
-    x="Distance",
-    y="Observed Head",
-    title="Observed vs Simulated Heads"
-)
-
-fig_profile.add_scatter(
-    x=plot_df["Distance"],
-    y=plot_df["Simulated Head"],
-    mode="markers+lines",
-    name="Simulated Head"
-)
-
-x_profile = np.linspace(0,L,200)
-
-h_profile = []
-
-for x in x_profile:
-
+    h(x)² = h1² - [(h1²-h2²)/L]·x + (R/Kf)·x·(L-x)
+    """
     h_sq = (
-        h1**2
-        - ((h1**2-h2**2)/L)*x
-        + (R/kf)*x*(L-x)
+        h1 ** 2
+        - ((h1 ** 2 - h2 ** 2) / L) * x_values
+        + (R / kf) * x_values * (L - x_values)
+    )
+    # Guard against numerical negatives (non-physical)
+    h_sq = np.maximum(h_sq, 0)
+    return np.sqrt(h_sq)
+
+
+def rmse(kf):
+    sim = simulate_heads(kf, df_obs["Distance"].values)
+    return np.sqrt(np.mean((sim - df_obs["Observed Head"].values) ** 2))
+
+# ─────────────────────────────────────────────
+# AUTO-CALIBRATION (scipy)
+# ─────────────────────────────────────────────
+
+st.subheader("🎯 Auto-Calibration")
+
+run_auto = st.button("▶ Run Auto-Calibration (minimise RMSE)", type="primary")
+
+kf_best = kf_manual  # default to manual
+
+if run_auto:
+    result = minimize_scalar(
+        rmse,
+        bounds=(kf_min, kf_max),
+        method="bounded"
     )
 
-    h_profile.append(np.sqrt(max(h_sq,0)))
+    if result.success:
+        kf_best = result.x
+        rmse_best = result.fun
+        st.success(
+            f"✅ Optimal Kf = **{kf_best:.4f} m/day** | RMSE = **{rmse_best:.4f} m**"
+        )
+        st.info(
+            f"log₁₀(Kf) = {np.log10(kf_best):.3f} | "
+            f"Kf falls in: {'gravel/coarse sand' if kf_best > 10 else 'medium sand' if kf_best > 1 else 'fine sand/silt'}"
+        )
+    else:
+        st.error("Auto-calibration did not converge. Check your input parameters.")
+        kf_best = kf_manual
+else:
+    kf_best = kf_manual
+    st.info("Using manually selected Kf. Press **Run Auto-Calibration** to find the optimal value.")
 
-fig_profile.add_scatter(
-    x=x_profile,
-    y=h_profile,
+# ─────────────────────────────────────────────
+# RESULTS TABLE
+# ─────────────────────────────────────────────
+
+st.subheader("📋 Simulation Results")
+
+sim_heads = simulate_heads(kf_best, df_obs["Distance"].values)
+df_results = df_obs.copy()
+df_results["Simulated Head (m)"] = np.round(sim_heads, 3)
+df_results["Residual (m)"] = np.round(sim_heads - df_obs["Observed Head"].values, 3)
+df_results["Abs Residual (m)"] = np.abs(df_results["Residual (m)"])
+
+current_rmse = rmse(kf_best)
+
+col1, col2, col3 = st.columns(3)
+col1.metric("RMSE (m)", round(current_rmse, 4))
+col2.metric("Max Abs Residual (m)", round(df_results["Abs Residual (m)"].max(), 4))
+col3.metric("Kf Used (m/day)", round(kf_best, 4))
+
+st.dataframe(df_results.style.background_gradient(subset=["Abs Residual (m)"], cmap="YlOrRd"), use_container_width=True)
+
+# ─────────────────────────────────────────────
+# HEAD PROFILE PLOT (new)
+# ─────────────────────────────────────────────
+
+st.subheader("📈 Head Profile Along Aquifer")
+
+x_cont = np.linspace(0, L, 500)
+h_cont = simulate_heads(kf_best, x_cont)
+
+fig_profile = go.Figure()
+
+# Continuous simulated profile
+fig_profile.add_trace(go.Scatter(
+    x=x_cont,
+    y=h_cont,
     mode="lines",
-    name="Model Water Table"
+    name=f"Simulated (Kf={round(kf_best,3)} m/day)",
+    line=dict(color="#1f77b4", width=2.5)
+))
+
+# Boundary heads
+fig_profile.add_trace(go.Scatter(
+    x=[0, L],
+    y=[h1, h2],
+    mode="markers",
+    name="Boundary Conditions",
+    marker=dict(symbol="diamond", size=12, color="green")
+))
+
+# Observed well heads
+fig_profile.add_trace(go.Scatter(
+    x=df_obs["Distance"],
+    y=df_obs["Observed Head"],
+    mode="markers",
+    name="Observed Wells",
+    marker=dict(symbol="circle", size=10, color="red",
+                line=dict(width=1.5, color="darkred"))
+))
+
+fig_profile.update_layout(
+    title="Groundwater Head Profile",
+    xaxis_title="Distance from Upstream Boundary (m)",
+    yaxis_title="Groundwater Head (m)",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    hovermode="x unified"
 )
 
-st.plotly_chart(fig_profile)
+st.plotly_chart(fig_profile, use_container_width=True)
 
-# ------------------------------------------------
+# ─────────────────────────────────────────────
 # SENSITIVITY ANALYSIS
-# ------------------------------------------------
+# ─────────────────────────────────────────────
 
-st.subheader("Sensitivity Analysis")
+st.subheader("🔍 Sensitivity Analysis — RMSE vs Kf")
 
-kf_range = np.logspace(log_min,log_max,100)
+kf_range = np.logspace(log_min, log_max, 200)
+rmse_curve = [rmse(k) for k in kf_range]
 
-rmse_curve = []
-
-for k in kf_range:
-
-    sim = simulate_heads(k)
-    res = sim - df_obs["Observed Head"].values
-
-    rmse_curve.append(
-        np.sqrt(np.nanmean(res**2))
-    )
-
-df_curve = pd.DataFrame({
-    "Kf":kf_range,
-    "RMSE":rmse_curve
-})
-
-fig = px.line(
-    df_curve,
-    x="Kf",
-    y="RMSE",
+fig_sens = px.line(
+    x=kf_range,
+    y=rmse_curve,
     log_x=True,
+    labels={"x": "Kf (m/day)", "y": "RMSE (m)"},
     title="Calibration Error vs Hydraulic Conductivity"
 )
 
-st.plotly_chart(fig)
-
-# ------------------------------------------------
-# MONTE CARLO UNCERTAINTY ANALYSIS
-# ------------------------------------------------
-
-st.subheader("Monte Carlo Uncertainty Analysis")
-
-n_sim = st.slider(
-    "Number of simulations",
-    100,
-    5000,
-    1000,
-    step=100
+# Mark best Kf on sensitivity plot
+fig_sens.add_vline(
+    x=kf_best,
+    line_dash="dash",
+    line_color="red",
+    annotation_text=f"Best Kf = {round(kf_best,3)}",
+    annotation_position="top right"
 )
 
-if st.button("Run Monte Carlo Simulation"):
+st.plotly_chart(fig_sens, use_container_width=True)
 
-    kf_samples = np.random.uniform(kf_min,kf_max,n_sim)
+# ─────────────────────────────────────────────
+# WATER TABLE DIVIDE DETECTION (bonus)
+# ─────────────────────────────────────────────
 
-    rmse_list = []
+st.subheader("📐 Water Table Divide")
 
-    for k in kf_samples:
+# The divide occurs where dh/dx = 0 — analytically:
+# x_divide = L/2 + Kf(h1²-h2²)/(2RL)
+# Only physically meaningful if 0 < x_divide < L
 
-        sim = simulate_heads(k)
+if R > 0:
+    x_divide = L / 2 + kf_best * (h1 ** 2 - h2 ** 2) / (2 * R * L)
+    if 0 < x_divide < L:
+        h_divide = float(simulate_heads(kf_best, np.array([x_divide]))[0])
+        st.success(
+            f"A **groundwater divide** exists at x = **{x_divide:.1f} m** "
+            f"(head = {h_divide:.2f} m). Flow is towards both boundaries from this point."
+        )
+    else:
+        st.info(
+            "No groundwater divide within the aquifer domain. "
+            "Flow is unidirectional from upstream to downstream."
+        )
+else:
+    st.info("Recharge R = 0: no divide possible (no recharge driving mound formation).")
 
-        res = sim - df_obs["Observed Head"].values
-
-        rmse_val = np.sqrt(np.nanmean(res**2))
-
-        rmse_list.append(rmse_val)
-
-    df_mc = pd.DataFrame({
-        "Kf":kf_samples,
-        "RMSE":rmse_list
-    })
-
-    st.dataframe(df_mc.head())
-
-    fig_mc = px.histogram(
-        df_mc,
-        x="Kf",
-        nbins=40,
-        title="Monte Carlo Distribution of Kf"
-    )
-
-    st.plotly_chart(fig_mc)
-
-    best_rmse = df_mc["RMSE"].min()
-
-    threshold = best_rmse*1.2
-
-    accepted = df_mc[df_mc["RMSE"]<=threshold]
-
-    kf_low = accepted["Kf"].min()
-    kf_high = accepted["Kf"].max()
-
-    st.write(
-        "Estimated Kf confidence range:",
-        round(kf_low,3),
-        "to",
-        round(kf_high,3),
-        "m/day"
-    )
-
-    fig_scatter = px.scatter(
-        df_mc,
-        x="Kf",
-        y="RMSE",
-        title="Monte Carlo Calibration Space"
-    )
-
-    st.plotly_chart(fig_scatter)
-
-# ------------------------------------------------
-# GOVERNING EQUATION
-# ------------------------------------------------
+# ─────────────────────────────────────────────
+# GOVERNING EQUATION & VARIABLE DEFINITIONS
+# ─────────────────────────────────────────────
 
 st.markdown("---")
 
-st.header("Governing Groundwater Equation")
+with st.expander("📖 Governing Equation & Variable Definitions", expanded=False):
 
-st.latex(r'''
-h(x)^2 =
-h_1^2 -
-\frac{(h_1^2-h_2^2)}{L}x +
-\frac{R}{K_f}x(L-x)
-''')
+    st.header("Governing Groundwater Equation")
 
-st.write("Steady-state groundwater flow in a 1D aquifer with uniform recharge.")
+    st.latex(r'''
+    h(x)^2 =
+    h_1^2 -
+    \frac{(h_1^2 - h_2^2)}{L}\,x +
+    \frac{R}{K_f}\,x(L-x)
+    ''')
 
-# ------------------------------------------------
-# VARIABLE DEFINITIONS
-# ------------------------------------------------
+    st.markdown(
+        """
+        **Derivation basis**: Darcy's Law combined with the continuity equation under the
+        Dupuit–Forchheimer assumption (vertical equipotentials). Valid for gentle water-table
+        gradients (slope < ~0.1).
+        """
+    )
 
-st.header("Variable Definitions")
+    definitions = {
+        "Variable": ["h(x)", "h₁", "h₂", "R", "Kf", "x", "L"],
+        "Description": [
+            "Simulated groundwater head at distance x",
+            "Fixed head at upstream boundary (x = 0)",
+            "Fixed head at downstream boundary (x = L)",
+            "Uniform vertical recharge to the aquifer",
+            "Horizontal hydraulic conductivity",
+            "Distance from upstream boundary",
+            "Total length between boundaries",
+        ],
+        "Units": ["m", "m", "m", "m/day", "m/day", "m", "m"],
+        "Typical Range": [
+            "—", "—", "—",
+            "0.00001–0.005 m/day",
+            "0.0001–1000 m/day",
+            "0 – L", "—",
+        ],
+    }
 
-definitions = {
+    st.table(pd.DataFrame(definitions))
 
-"Variable":[
-"h(x)",
-"h1",
-"h2",
-"R",
-"Kf",
-"x",
-"L"
-],
+    st.markdown(
+        """
+        **Conceptual assumptions:**
+        - Steady-state conditions (no storage change)  
+        - Homogeneous, isotropic aquifer  
+        - Uniform recharge over the full domain  
+        - 1D flow along the hydraulic gradient  
+        - Unconfined aquifer (Dupuit–Forchheimer; use linear-h form for confined)
 
-"Description":[
-"Simulated groundwater head at distance x",
-"Groundwater head at upstream boundary",
-"Groundwater head at downstream boundary",
-"Recharge entering the aquifer",
-"Hydraulic conductivity",
-"Distance from upstream boundary",
-"Aquifer flow length"
-],
-
-"Units":[
-"m",
-"m",
-"m",
-"m/day",
-"m/day",
-"m",
-"m"
-]
-
-}
-
-st.table(pd.DataFrame(definitions))
-
-st.write("""
-Conceptual assumptions
-
-• steady-state groundwater conditions  
-• homogeneous aquifer properties  
-• uniform recharge  
-• one-dimensional groundwater flow
-""")
-
-st.write("""
-This conceptual tool helps estimate realistic hydraulic conductivity ranges before building numerical groundwater models such as MODFLOW.
-""")
+        This simplified model estimates realistic Kf values before building full numerical models (e.g., MODFLOW).
+        """
+    )
